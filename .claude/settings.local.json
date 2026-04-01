@@ -1,0 +1,21 @@
+{
+  "allowedTools": [
+    "Bash(git *)",
+    "Bash(python3 *)",
+    "Bash(docker compose *)",
+    "Bash(ssh *)",
+    "Bash(scp *)",
+    "Bash(cat *)",
+    "Bash(tail *)",
+    "Bash(grep *)",
+    "Bash(crontab -l)",
+    "Bash(source /root/llmroute/axis_env.sh *)",
+    "Edit(/root/llmroute/*)"
+  ],
+  "denyTools": [
+    "Bash(docker-compose *)",
+    "Bash(python *)",
+    "Bash(rm -rf *)",
+    "Bash(git push *)"
+  ]
+}
