@@ -26,6 +26,7 @@ Cost target: < $0.05 per scan when no signals found (batched LLM calls)
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -67,6 +68,13 @@ NOISE_SLUGS = [
     "mrbeasts-next-video",
     "mrbeast-video",
     "views-on-day-1",
+    # Crypto price markets — 0% WR on 6 resolved trades, no AI edge
+    "will-bitcoin-", "will-btc-", "bitcoin-above", "bitcoin-below",
+    "will-ethereum-", "will-eth-", "ethereum-above", "ethereum-below",
+    "will-solana-", "will-sol-", "solana-above", "solana-below",
+    "will-crypto-", "crypto-above", "crypto-below",
+    "bitcoin-dip", "bitcoin-reach", "ethereum-dip", "ethereum-reach",
+    "ethereum-above-", "ethereum-price",
 ]
 NOISE_QUESTION_PATTERNS = [
     r"elon musk.*tweet",
@@ -77,11 +85,26 @@ NOISE_QUESTION_PATTERNS = [
     r"one day after launch",
     r"mrbeast.*video.*views",
     r"views on day 1",
+    # Crypto price patterns — blocked due to 0% WR
+    r"will bitcoin (reach|dip|hit|drop)",
+    r"will ethereum (reach|dip|hit|drop|be above)",
+    r"will solana (reach|dip|hit|drop)",
+    r"bitcoin (above|below|price|at) \$",
+    r"ethereum (above|below|price|at) \$",
     r"get between .* million views",
     r"token.*fdv",
     r"market cap.*one day after",
 ]
+BLOCKED_SPORTS_IN_PMS = True  # Sports routed to AXIS_CROW as of 2026-04-01
+SPORTS_SLUG_PREFIXES = [
+    "nba-", "nfl-", "nhl-", "mlb-", "cbb-", "cfb-", "epl-",
+    "atp-", "wta-", "crint-", "mma-", "boxing-", "f1-",
+    "nascar-", "soccer-", "rugby-",
+]
 MIN_HOURS_TO_RESOLVE = 24   # Skip markets resolving within 24h
+MAX_RESOLUTION_DAYS = 90    # Skip markets resolving more than 90 days out
+THEME_DEDUP_WINDOW_H = 48   # Suppress themes with 2+ signals in this window
+THEME_DEDUP_MAX = 2          # Max signals per theme in the window
 
 # Scanning parameters
 MARKETS_PER_PAGE = 50       # Gamma API page size
@@ -97,6 +120,7 @@ WORKSPACE = os.environ.get("AXIS_WORKSPACE", "/home/node/.openclaw/workspace")
 HEALTH_FILE = os.path.join(WORKSPACE, "memory", "scan-health-axis_pms.json")
 PAPER_TRADES = os.path.join(WORKSPACE, "memory", "paper-trades.md")
 SCAN_LOG = os.path.join(WORKSPACE, "memory", "axis_pms_scan.log")
+THEME_LOG = os.path.join(WORKSPACE, "memory", "theme_dedup.json")
 
 
 # ─── API HELPERS ──────────────────────────────────────────────────────────────
@@ -298,6 +322,9 @@ def filter_market(m):
             hours_left = (end_date - datetime.now(timezone.utc)).total_seconds() / 3600
             if hours_left < MIN_HOURS_TO_RESOLVE:
                 return False, f"resolving_soon ({hours_left:.0f}h)"
+            days_left = hours_left / 24
+            if days_left > MAX_RESOLUTION_DAYS:
+                return False, f"RESOLUTION_GATE: {m.get('slug', 'unknown')} — {days_left:.0f} days exceeds limit"
         except (ValueError, TypeError):
             pass  # Can't parse date, don't filter
 
@@ -390,6 +417,7 @@ def log_paper_trade(signal):
         f"- Signal Tier: {signal['tier']}\n"
         f"- Whale Confirmed: {signal.get('whale_confirmed', False)}\n"
         f"- Volume 24h: ${signal.get('volume24h', 0):,.0f}\n"
+        f"- Resolution Criteria: {signal.get('description', '')[:300]}\n"
         f"- Outcome: PENDING\n"
         f"\n"
     )
@@ -440,6 +468,83 @@ def signal_output(tier, ai_est, crowd, gap, question, slug, direction, volume24h
     print(f"SIGNAL|{tier}|{ai_est:.4f}|{crowd:.4f}|{gap:.1f}|{question}|{slug}|{direction}|{volume24h:.0f}|{whale}")
 
 
+# ─── THEMATIC CLUSTER DEDUP ───────────────────────────────────────────────────
+
+THEME_PATTERNS = [
+    (r"iran|iranian|tehran|irgc|khamenei", "iran-conflict"),
+    (r"ukraine|ukrainian|kyiv|zelensky|donbas|crimea", "ukraine-conflict"),
+    (r"russia|russian|putin|kremlin|moscow", "russia-geopolitics"),
+    (r"israel|israeli|idf|netanyahu|gaza|hamas|hezbollah", "israel-conflict"),
+    (r"china|chinese|beijing|xi jinping|taiwan|pla", "china-geopolitics"),
+    (r"trump.*president|trump.*2028|trump.*term", "trump-presidency"),
+    (r"democrat.*nomin|2028.*dem|dem.*primary", "2028-dem-nom"),
+    (r"republican.*nomin|gop.*primary|2028.*rep", "2028-rep-nom"),
+    (r"hungar|orban|fidesz", "hungarian-election"),
+    (r"french.*election|macron|le pen|france.*vote", "french-election"),
+    (r"german.*election|bundestag|scholz|merz", "german-election"),
+    (r"uk.*election|labour|conservative|starmer|sunak", "uk-election"),
+    (r"bitcoin|btc.*price|btc.*above|btc.*below", "bitcoin-price"),
+    (r"ethereum|eth.*price|eth.*above|eth.*below", "ethereum-price"),
+    (r"fed.*rate|fomc.*rate|interest rate.*fed", "fed-rates"),
+    (r"tariff|trade war|import duty", "tariff-trade"),
+    (r"ceasefire", "ceasefire-talks"),
+    (r"nuclear|nuke", "nuclear-risk"),
+    (r"recession|gdp.*contract|economic.*downturn", "recession-risk"),
+    (r"ai.*regulation|ai.*ban|ai.*executive order", "ai-regulation"),
+]
+
+
+def extract_theme(slug, question):
+    """Extract a thematic key from slug/question. Returns theme string or None."""
+    text = f"{slug} {question}".lower()
+    for pattern, theme_key in THEME_PATTERNS:
+        if re.search(pattern, text):
+            return theme_key
+    return None
+
+
+def load_theme_log():
+    """Load theme signal timestamps from disk."""
+    try:
+        with open(THEME_LOG, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_theme_log(data):
+    """Persist theme signal timestamps."""
+    try:
+        os.makedirs(os.path.dirname(THEME_LOG), exist_ok=True)
+        with open(THEME_LOG, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log(f"WARNING: Could not write theme log: {e}")
+
+
+def check_theme_dedup(theme_key, theme_log):
+    """Return True if this theme should be suppressed (already has THEME_DEDUP_MAX signals in window)."""
+    if not theme_key:
+        return False
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=THEME_DEDUP_WINDOW_H)).isoformat()
+    entries = theme_log.get(theme_key, [])
+    recent = [ts for ts in entries if ts >= cutoff]
+    return len(recent) >= THEME_DEDUP_MAX
+
+
+def record_theme_signal(theme_key, theme_log):
+    """Record a signal timestamp for this theme."""
+    if not theme_key:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    if theme_key not in theme_log:
+        theme_log[theme_key] = []
+    theme_log[theme_key].append(now)
+    # Prune old entries (older than 2x window)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=THEME_DEDUP_WINDOW_H * 2)).isoformat()
+    theme_log[theme_key] = [ts for ts in theme_log[theme_key] if ts >= cutoff]
+
+
 # ─── MAIN SCAN ────────────────────────────────────────────────────────────────
 
 def run_scan(dry_run=False):
@@ -480,6 +585,7 @@ def run_scan(dry_run=False):
                     "volume24h": float(m.get("volume24hr") or 0),
                     "liquidity": float(m.get("liquidity") or m.get("liquidityNum") or 0),
                     "end_date": m.get("endDate", ""),
+                    "description": m.get("description", ""),
                 })
 
     log(f"After filtering: {len(candidates)} candidates from {len(raw_markets)} markets")
@@ -498,6 +604,9 @@ def run_scan(dry_run=False):
     # Load existing slugs for dedup
     existing_slugs = load_existing_slugs()
     log(f"Loaded {len(existing_slugs)} existing slugs for dedup")
+
+    # Load theme dedup log
+    theme_log = load_theme_log()
 
     # Step 4: Batch candidates and get AI estimates from DeepSeek
     signals = []
@@ -556,10 +665,17 @@ def run_scan(dry_run=False):
                     if crowd_dominant > SPORTS_CROWD_MAX:
                         log(f"SKIP sports inversion (crowd too certain: {crowd_dominant:.0%}): {market['slug']}")
                         continue
+                    log(f"INVERSION: crowd-bias-sports — {market['slug']} (AI={ai_est:.2f} crowd={crowd:.2f})")
                     if direction == "BUY YES":
                         direction = "BUY NO (INVERTED-SPORTS)"
                     else:
                         direction = "BUY YES (INVERTED-SPORTS)"
+
+                # Thematic cluster dedup
+                theme_key = extract_theme(market["slug"], market["question"])
+                if check_theme_dedup(theme_key, theme_log):
+                    log(f"THEME_DEDUP: {market['slug']}")
+                    continue
 
                 sig = {
                     "tier": tier,
@@ -571,8 +687,10 @@ def run_scan(dry_run=False):
                     "direction": direction,
                     "volume24h": market["volume24h"],
                     "whale_confirmed": whale,
+                    "description": market.get("description", ""),
                 }
                 signals.append(sig)
+                record_theme_signal(theme_key, theme_log)
 
                 # Output signal line for wrapper
                 signal_output(
@@ -600,6 +718,7 @@ def run_scan(dry_run=False):
         f"(RED:{red_count} YELLOW:{yellow_count} GREEN:{green_count}) ===")
 
     write_health(len(candidates), len(signals), red_count, yellow_count)
+    save_theme_log(theme_log)
     print(f"SCAN_COMPLETE|{len(candidates)}|{len(signals)}|{red_count}|{yellow_count}")
 
 
